@@ -1,12 +1,22 @@
 [package]
 name = "togara-kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "TOGARA OS Trinity - Minimal bootable kernel with userspace support"
 
 [dependencies]
 
 [features]
 default = []
 
-[lib]
-crate-type = ["staticlib"]
+[[bin]]
+name = "togara-kernel"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
