@@ -1,0 +1,14 @@
+ELF BINARY PLACEHOLDER - This would be a real compiled x86_64 ELF binary.
+
+In a real implementation, this file would contain:
+- A statically linked x86_64 binary
+- That uses syscalls to write "Hello from userspace!" to stdout
+- And then exits with code 0
+
+To create this binary:
+1. Write hello.asm with syscall instructions
+2. Assemble with: nasm -f elf64 hello.asm
+3. Link with: ld -o hello.elf hello.o
+
+For now, this is a placeholder that the ELF loader will reject.
+The actual binary needs to be built separately and placed here.
