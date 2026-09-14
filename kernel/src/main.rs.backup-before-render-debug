@@ -1,0 +1,3018 @@
+#![no_std]
+#![no_main]
+#![feature(abi_x86_interrupt)]
+
+mod interrupts;
+mod memory;
+mod system;
+
+use bootloader_api::info::{FrameBuffer, PixelFormat};
+use bootloader_api::{BootInfo, entry_point};
+use core::panic::PanicInfo;
+
+const CYAN: [u8; 3] = [40, 245, 255];
+const MAGENTA: [u8; 3] = [255, 35, 220];
+const GOLD: [u8; 3] = [255, 205, 70];
+const WHITE: [u8; 3] = [235, 252, 255];
+const DIM: [u8; 3] = [82, 125, 155];
+const DIM2: [u8; 3] = [38, 67, 92];
+const GREEN: [u8; 3] = [70, 255, 165];
+const RED: [u8; 3] = [255, 75, 95];
+
+const MAX_INPUT: usize = 64;
+
+entry_point!(kernel_main);
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    let usable_memory_regions = memory::init(boot_info.memory_regions.as_ref());
+
+    interrupts::init();
+
+    if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
+        run_desktop(framebuffer, usable_memory_regions);
+    }
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn run_desktop(framebuffer: &mut FrameBuffer, usable_memory_regions: usize) -> ! {
+    let mut input = [0u8; MAX_INPUT];
+    let mut input_len = 0usize;
+
+    draw_desktop(
+        framebuffer,
+        usable_memory_regions,
+        &input,
+        input_len,
+        "",
+        GREEN,
+    );
+
+    loop {
+        let scancode = match interrupts::keyboard::pop_scancode() {
+            Some(scancode) => scancode,
+            None => {
+                core::hint::spin_loop();
+                continue;
+            }
+        };
+
+        // Ignore key-release scancodes.
+        if scancode & 0x80 != 0 {
+            continue;
+        }
+
+        let ascii = scancode_to_ascii(scancode);
+
+        if ascii == b'\n' {
+            let result = execute_command(&input[..input_len]);
+            let message = core::str::from_utf8(&result.message[..result.len]).unwrap_or("");
+
+            draw_desktop(
+                framebuffer,
+                usable_memory_regions,
+                &input,
+                input_len,
+                message,
+                result.color,
+            );
+
+            input_len = 0;
+            input.fill(0);
+        } else if ascii == 8 {
+            if input_len > 0 {
+                input_len -= 1;
+                input[input_len] = 0;
+            }
+
+            draw_desktop(
+                framebuffer,
+                usable_memory_regions,
+                &input,
+                input_len,
+                "",
+                GREEN,
+            );
+        } else if ascii != 0 && input_len < MAX_INPUT {
+            input[input_len] = ascii;
+            input_len += 1;
+
+            draw_desktop(
+                framebuffer,
+                usable_memory_regions,
+                &input,
+                input_len,
+                "",
+                GREEN,
+            );
+        }
+    }
+}
+
+fn scancode_to_ascii(scancode: u8) -> u8 {
+    match scancode {
+        // Number row.
+        0x02 => b'1',
+        0x03 => b'2',
+        0x04 => b'3',
+        0x05 => b'4',
+        0x06 => b'5',
+        0x07 => b'6',
+        0x08 => b'7',
+        0x09 => b'8',
+        0x0A => b'9',
+        0x0B => b'0',
+
+        // QWERTY.
+        0x10 => b'Q',
+        0x11 => b'W',
+        0x12 => b'E',
+        0x13 => b'R',
+        0x14 => b'T',
+        0x15 => b'Y',
+        0x16 => b'U',
+        0x17 => b'I',
+        0x18 => b'O',
+        0x19 => b'P',
+
+        0x1E => b'A',
+        0x1F => b'S',
+        0x20 => b'D',
+        0x21 => b'F',
+        0x22 => b'G',
+        0x23 => b'H',
+        0x24 => b'J',
+        0x25 => b'K',
+        0x26 => b'L',
+
+        0x2C => b'Z',
+        0x2D => b'X',
+        0x2E => b'C',
+        0x2F => b'V',
+        0x30 => b'B',
+        0x31 => b'N',
+        0x32 => b'M',
+
+        // Controls / symbols.
+        0x39 => b' ',
+        0x0C => b'-',
+        0x0D => b'=',
+        0x1C => b'\n',
+        0x0E => 8,
+
+        _ => 0,
+    }
+}
+
+const MAX_COMMAND_OUTPUT: usize = 128;
+
+struct CommandResult {
+    message: [u8; MAX_COMMAND_OUTPUT],
+    len: usize,
+    color: [u8; 3],
+}
+
+impl CommandResult {
+    const fn empty(color: [u8; 3]) -> Self {
+        Self {
+            message: [0; MAX_COMMAND_OUTPUT],
+            len: 0,
+            color,
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+
+        while i < bytes.len() && self.len < MAX_COMMAND_OUTPUT {
+            self.message[self.len] = bytes[i];
+            self.len += 1;
+            i += 1;
+        }
+    }
+
+    fn push_u64(&mut self, mut value: u64) {
+        let mut digits = [0u8; 20];
+        let mut len = 0usize;
+
+        if value == 0 {
+            self.push_bytes(b"0");
+            return;
+        }
+
+        while value > 0 && len < digits.len() {
+            digits[len] = b'0' + (value % 10) as u8;
+            value /= 10;
+            len += 1;
+        }
+
+        while len > 0 {
+            len -= 1;
+            self.push_bytes(&[digits[len]]);
+        }
+    }
+
+    fn push_hex_u64(&mut self, mut value: u64) {
+        let mut digits = [0u8; 16];
+        let mut len = 0usize;
+
+        if value == 0 {
+            self.push_bytes(b"0");
+            return;
+        }
+
+        while value > 0 && len < digits.len() {
+            let digit = (value & 0xF) as u8;
+            digits[len] = match digit {
+                0..=9 => b'0' + digit,
+                _ => b'A' + (digit - 10),
+            };
+            value >>= 4;
+            len += 1;
+        }
+
+        while len > 0 {
+            len -= 1;
+            self.push_bytes(&[digits[len]]);
+        }
+    }
+
+    fn push_u64_padded(&mut self, mut value: u64, width: usize) {
+        let mut divisor = 1u64;
+        let mut i = 1usize;
+
+        while i < width {
+            divisor *= 10;
+            i += 1;
+        }
+
+        while divisor > 0 {
+            let digit = value / divisor;
+            self.push_bytes(&[b'0' + digit as u8]);
+            value %= divisor;
+            divisor /= 10;
+        }
+    }
+}
+
+fn command_result(message: &[u8], color: [u8; 3]) -> CommandResult {
+    let mut result = CommandResult::empty(color);
+    result.push_bytes(message);
+    result
+}
+
+fn execute_command(command: &[u8]) -> CommandResult {
+    if equals(command, b"HELP") {
+        return command_result(
+            b"COMMANDS: HELP REALMS MEMORY ALLOC FREE EVENTS SYSTEM UPTIME CLEAR ABOUT",
+            CYAN,
+        );
+    }
+
+    if equals(command, b"REALMS") {
+        return command_result(b"REALMS: CORE MEMORY EVENTS NETWORK SHELL", MAGENTA);
+    }
+
+    if equals(command, b"MEMORY") {
+        let mut result = CommandResult::empty(GOLD);
+        result.push_bytes(b"MEMORY ONLINE // TOTAL ");
+        result.push_u64(memory::total_mib());
+        result.push_bytes(b" MiB // USABLE ");
+        result.push_u64(memory::usable_mib());
+        result.push_bytes(b" MiB // ALLOCATED ");
+        result.push_u64(memory::allocated_mib());
+        result.push_bytes(b" MiB // REGIONS ");
+        result.push_u64(memory::region_count());
+        result.push_bytes(b" // ALLOCATOR ");
+        result.push_bytes(if memory::allocator_initialized() {
+            b"READY"
+        } else {
+            b"OFFLINE"
+        });
+        return result;
+    }
+
+    if equals(command, b"ALLOC") {
+        let mut result = CommandResult::empty(CYAN);
+
+        match memory::allocate_frame() {
+            Some(address) => {
+                result.push_bytes(b"FRAME ALLOCATED // PHYS 0x");
+                result.push_hex_u64(address);
+                result.push_bytes(b" // TOTAL ");
+                result.push_u64(memory::allocated_frames());
+            }
+            None => {
+                result.push_bytes(b"FRAME ALLOCATION FAILED // NO USABLE FRAME AVAILABLE");
+                result.color = RED;
+            }
+        }
+
+        return result;
+    }
+
+    if equals(command, b"FREE") {
+        let mut result = CommandResult::empty(MAGENTA);
+
+        match memory::free_last_frame() {
+            Some(address) => {
+                result.push_bytes(b"FRAME RELEASED // PHYS 0x");
+                result.push_hex_u64(address);
+                result.push_bytes(b" // TOTAL ");
+                result.push_u64(memory::allocated_frames());
+            }
+            None => {
+                result.push_bytes(b"FRAME RELEASE FAILED // NO ALLOCATED FRAME AVAILABLE");
+                result.color = RED;
+            }
+        }
+
+        return result;
+    }
+
+    if equals(command, b"EVENTS") {
+        let events = system::state::keyboard_events();
+
+        let mut result = CommandResult::empty(CYAN);
+        result.push_bytes(b"EVENT FABRIC ONLINE - KEYBOARD EVENTS: ");
+        result.push_u64(events);
+
+        return result;
+    }
+
+    if equals(command, b"UPTIME") {
+        let seconds = system::state::uptime_seconds();
+        let millis = system::state::uptime_millis();
+
+        let mut result = CommandResult::empty(GREEN);
+        result.push_bytes(b"UPTIME: ");
+        result.push_u64(seconds);
+        result.push_bytes(b".");
+        result.push_u64_padded(millis, 3);
+        result.push_bytes(b" SEC");
+
+        return result;
+    }
+
+    if equals(command, b"SYSTEM") {
+        let ticks = system::state::uptime_ticks();
+
+        let mut result = CommandResult::empty(GREEN);
+        result.push_bytes(b"TOGARA CORE ONLINE - STATE FABRIC ACTIVE - TICKS: ");
+        result.push_u64(ticks);
+
+        return result;
+    }
+
+    if equals(command, b"CLEAR") {
+        return CommandResult::empty(WHITE);
+    }
+
+    if equals(command, b"ABOUT") {
+        return command_result(b"TOGARA OS - BARE METAL OPERATING INTELLIGENCE", WHITE);
+    }
+
+    if command.is_empty() {
+        return CommandResult::empty(WHITE);
+    }
+
+    command_result(b"UNKNOWN COMMAND - TYPE HELP", RED)
+}
+
+fn equals(value: &[u8], expected: &[u8]) -> bool {
+    if value.len() != expected.len() {
+        return false;
+    }
+
+    let mut i = 0;
+
+    while i < expected.len() {
+        if value[i] != expected[i] {
+            return false;
+        }
+
+        i += 1;
+    }
+
+    true
+}
+
+fn draw_desktop(
+    framebuffer: &mut FrameBuffer,
+    usable_memory_regions: usize,
+    input: &[u8; MAX_INPUT],
+    input_len: usize,
+    message: &str,
+    message_color: [u8; 3],
+) {
+    let info = framebuffer.info();
+    let width = info.width;
+    let height = info.height;
+    let stride = info.stride;
+    let bpp = info.bytes_per_pixel;
+    let format = info.pixel_format;
+
+    if width < 640 || height < 360 {
+        return;
+    }
+
+    let buf = framebuffer.buffer_mut();
+
+    // Design grid is authored around 1280x720, then proportionally projected.
+    let sx = width.max(640) as u64;
+    let sy = height.max(360) as u64;
+    let px = |v: usize| ((v as u64 * sx) / 1280) as usize;
+    let py = |v: usize| ((v as u64 * sy) / 720) as usize;
+
+    premium_background(buf, width, height, stride, bpp, format);
+
+    // Outer luminous frame.
+    let inset = px(18);
+    frame(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        inset,
+        py(27),
+        width.saturating_sub(inset * 2),
+        height.saturating_sub(py(38)),
+        [12, 45, 68],
+    );
+
+    // Corner light cuts.
+    corner_mark(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        inset + px(1),
+        py(40),
+        CYAN,
+        true,
+        true,
+    );
+    corner_mark(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width.saturating_sub(inset + px(1)),
+        py(40),
+        MAGENTA,
+        false,
+        true,
+    );
+    corner_mark(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        inset + px(1),
+        height.saturating_sub(py(22)),
+        GOLD,
+        true,
+        false,
+    );
+    corner_mark(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width.saturating_sub(inset + px(1)),
+        height.saturating_sub(py(22)),
+        CYAN,
+        false,
+        false,
+    );
+
+    // Header glass slab.
+    let hx = px(24);
+    let hy = py(40);
+    let hw = width.saturating_sub(px(48));
+    let hh = py(66);
+    holographic_panel(
+        buf, width, height, stride, bpp, format, hx, hy, hw, hh, CYAN,
+    );
+
+    // TOGARA identity.
+    gradient_text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(54),
+        py(54),
+        "TOGARA",
+        4,
+        MAGENTA,
+        CYAN,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(56),
+        py(91),
+        "OPERATING SYSTEM",
+        1,
+        DIM,
+    );
+
+    // Header center.
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(590),
+        py(58),
+        "NEXUS",
+        2,
+        GOLD,
+        true,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(516),
+        py(77),
+        px(757),
+        py(77),
+        [26, 45, 62],
+    );
+
+    // Header status.
+    status_dot(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(1100),
+        py(63),
+        GREEN,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(1117),
+        py(57),
+        "CORE ONLINE",
+        2,
+        GREEN,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(1118),
+        py(83),
+        "SIMULATION",
+        1,
+        MAGENTA,
+    );
+
+    // Main hero field.
+    let hero_top = py(135);
+    let hero_bottom = py(535);
+
+    // Atmospheric energy behind the hero.
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(1000),
+        py(325),
+        px(245),
+        [58, 16, 90],
+        18,
+    );
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(1000),
+        py(325),
+        px(175),
+        [16, 55, 105],
+        24,
+    );
+
+    // Left hero copy.
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(58),
+        hero_top + py(14),
+        "OPERATING INTELLIGENCE LAYER",
+        1,
+        CYAN,
+    );
+
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(58),
+        hero_top + py(45),
+        "ONE OS.",
+        7,
+        WHITE,
+        true,
+    );
+
+    // Gradient headline is the visual signature.
+    gradient_text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(58),
+        hero_top + py(112),
+        "INFINITE REALMS.",
+        5,
+        MAGENTA,
+        CYAN,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(59),
+        hero_top + py(178),
+        "TOGARA CONNECTS HUMAN INTENT TO GOVERNED EXECUTION",
+        1,
+        DIM,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(59),
+        hero_top + py(198),
+        "THROUGH IDENTITY, AI AGENTS, REALMS, EVENTS AND A",
+        1,
+        DIM,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(59),
+        hero_top + py(218),
+        "TRACEABLE REQUIREMENTS LIFECYCLE.",
+        1,
+        DIM,
+    );
+
+    // Hero action controls.
+    holographic_button(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(58),
+        hero_top + py(260),
+        px(160),
+        py(37),
+        "RUN AGENT FLOW",
+        MAGENTA,
+    );
+    holographic_button(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(228),
+        hero_top + py(260),
+        px(188),
+        py(37),
+        "EXPLORE KNOWLEDGE",
+        CYAN,
+    );
+
+    // Holographic T core.
+    let core_x = px(1000);
+    let core_y = py(315);
+    holographic_emblem(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        core_x,
+        core_y,
+        px(78),
+    );
+
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        core_x.saturating_sub(px(18)),
+        core_y.saturating_sub(py(25)),
+        "T",
+        6,
+        [105, 170, 255],
+        true,
+    );
+
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(932),
+        py(426),
+        "TOGARA CORE",
+        2,
+        WHITE,
+        true,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(947),
+        py(448),
+        "IDENTITY // EVENT FABRIC // AI",
+        1,
+        DIM,
+    );
+
+    // Tiny floating holographic telemetry around the core.
+    holo_chip(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(848),
+        py(250),
+        px(92),
+        py(25),
+        "REALMS",
+        MAGENTA,
+    );
+    holo_chip(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(1068),
+        py(240),
+        px(108),
+        py(25),
+        "EVENT FABRIC",
+        CYAN,
+    );
+    holo_chip(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(1085),
+        py(405),
+        px(94),
+        py(25),
+        "SYSTEM",
+        CYAN,
+    );
+
+    // Metrics strip.
+    let stat_y = py(500);
+    let stat_h = py(90);
+    let stat_x = px(22);
+    let stat_w = width.saturating_sub(px(44));
+    metrics_panel(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        stat_x,
+        stat_y,
+        stat_w,
+        stat_h,
+        usable_memory_regions,
+    );
+
+    // Command deck at the bottom.
+    let deck_x = px(22);
+    let deck_y = py(605);
+    let deck_w = width.saturating_sub(px(44));
+    let deck_h = py(73);
+
+    holographic_panel(
+        buf, width, height, stride, bpp, format, deck_x, deck_y, deck_w, deck_h, GOLD,
+    );
+
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        deck_x + px(17),
+        deck_y + py(9),
+        "COMMAND DECK",
+        2,
+        GOLD,
+        true,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        deck_x + deck_w.saturating_sub(px(96)),
+        deck_y + py(13),
+        "TTY // READY",
+        1,
+        GREEN,
+    );
+
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        deck_x + px(16),
+        deck_y + py(30),
+        deck_x + deck_w.saturating_sub(px(16)),
+        deck_y + py(30),
+        [54, 38, 16],
+    );
+
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        deck_x + px(17),
+        deck_y + py(41),
+        ">",
+        2,
+        CYAN,
+        true,
+    );
+
+    text_bytes(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        deck_x + px(34),
+        deck_y + py(42),
+        input,
+        input_len,
+        1,
+        WHITE,
+    );
+
+    if message.is_empty() {
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            format,
+            deck_x + px(18),
+            deck_y + py(61),
+            "TYPE HELP // COMMAND MATRIX ONLINE",
+            1,
+            DIM,
+        );
+    } else {
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            format,
+            deck_x + px(18),
+            deck_y + py(61),
+            message,
+            1,
+            message_color,
+        );
+    }
+
+    // Bottom system rail.
+    let fy = height.saturating_sub(py(18));
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(54),
+        fy,
+        "NEXUS",
+        1,
+        CYAN,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(123),
+        fy,
+        "REALMS",
+        1,
+        MAGENTA,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        px(205),
+        fy,
+        "EVENT FABRIC",
+        1,
+        GOLD,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width.saturating_sub(px(170)),
+        fy,
+        "MEMORY // VERIFIED",
+        1,
+        GREEN,
+    );
+}
+
+fn premium_background(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+) {
+    // Deep navy/purple atmospheric field.
+    for y in 0..height {
+        let yy = y as u64;
+        let hh = height.max(1) as u64;
+        let vertical = (yy * 255 / hh) as u8;
+
+        for x in 0..width {
+            let xx = x as i64;
+            let cx = width as i64 / 2;
+            let cy = height as i64 / 2;
+            let dx = xx - cx;
+            let dy = y as i64 - cy;
+            let d = ((dx * dx + dy * dy) as u64).min(8_000_000);
+            let radial = 255u64.saturating_sub(d * 255 / 8_000_000);
+
+            let purple = (radial * 18 / 255) as u8;
+            let blue = (radial * 30 / 255) as u8;
+
+            let r = 3u16 + purple as u16 + (vertical as u16 * 3 / 255);
+            let g = 4u16 + (purple as u16 / 3);
+            let b = 15u16 + blue as u16 + (vertical as u16 * 7 / 255);
+
+            pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                x,
+                y,
+                [r.min(255) as u8, g.min(255) as u8, b.min(255) as u8],
+            );
+        }
+    }
+
+    // Fine holographic grid.
+    let gx = (width / 56).max(12);
+    let gy = (height / 36).max(10);
+
+    let mut x = 0;
+    while x < width {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            0,
+            x,
+            height.saturating_sub(1),
+            if x % (gx * 4) == 0 {
+                [5, 17, 38]
+            } else {
+                [3, 9, 25]
+            },
+        );
+        x += gx;
+    }
+
+    let mut y = 0;
+    while y < height {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            0,
+            y,
+            width.saturating_sub(1),
+            y,
+            if y % (gy * 4) == 0 {
+                [5, 17, 38]
+            } else {
+                [3, 9, 25]
+            },
+        );
+        y += gy;
+    }
+
+    // Soft energy clouds.
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width * 78 / 100,
+        height * 43 / 100,
+        width.min(height) / 3,
+        [30, 18, 90],
+        18,
+    );
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width * 58 / 100,
+        height * 54 / 100,
+        width.min(height) / 4,
+        [10, 35, 78],
+        13,
+    );
+}
+
+fn holographic_panel(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    accent: [u8; 3],
+) {
+    if w < 10 || h < 10 {
+        return;
+    }
+
+    let x2 = x.saturating_add(w).min(width);
+    let y2 = y.saturating_add(h).min(height);
+
+    // Translucent dark glass.
+    for yy in y..y2 {
+        for xx in x..x2 {
+            let edge = xx == x || xx + 1 == x2 || yy == y || yy + 1 == y2;
+            let base = if edge { [8, 13, 31] } else { [4, 8, 22] };
+            blend_pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                xx,
+                yy,
+                base,
+                if edge { 185 } else { 225 },
+            );
+        }
+    }
+
+    // Luminous edge.
+    glow_frame(buf, width, height, stride, bpp, fmt, x, y, w, h, accent);
+
+    // Inner reflection line.
+    if w > 30 {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x + 10,
+            y + 2,
+            x2.saturating_sub(10),
+            y + 2,
+            [18, 42, 63],
+        );
+    }
+}
+
+fn gradient_text(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    value: &str,
+    scale: usize,
+    left: [u8; 3],
+    right: [u8; 3],
+) {
+    let count = value.len().max(1);
+    for (i, byte) in value.bytes().enumerate() {
+        let t = (i * 255 / count.saturating_sub(1).max(1)) as u16;
+
+        let color = [
+            ((left[0] as u16 * (255 - t) + right[0] as u16 * t) / 255) as u8,
+            ((left[1] as u16 * (255 - t) + right[1] as u16 * t) / 255) as u8,
+            ((left[2] as u16 * (255 - t) + right[2] as u16 * t) / 255) as u8,
+        ];
+
+        let char_x = x + i * 6 * scale;
+        text_scaled(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            char_x,
+            y,
+            &byte_to_string(byte),
+            scale,
+            color,
+            true,
+        );
+    }
+}
+
+fn byte_to_string(byte: u8) -> &'static str {
+    match byte {
+        b'A' | b'a' => "A",
+        b'B' | b'b' => "B",
+        b'C' | b'c' => "C",
+        b'D' | b'd' => "D",
+        b'E' | b'e' => "E",
+        b'F' | b'f' => "F",
+        b'G' | b'g' => "G",
+        b'H' | b'h' => "H",
+        b'I' | b'i' => "I",
+        b'J' | b'j' => "J",
+        b'K' | b'k' => "K",
+        b'L' | b'l' => "L",
+        b'M' | b'm' => "M",
+        b'N' | b'n' => "N",
+        b'O' | b'o' => "O",
+        b'P' | b'p' => "P",
+        b'Q' | b'q' => "Q",
+        b'R' | b'r' => "R",
+        b'S' | b's' => "S",
+        b'T' | b't' => "T",
+        b'U' | b'u' => "U",
+        b'V' | b'v' => "V",
+        b'W' | b'w' => "W",
+        b'X' | b'x' => "X",
+        b'Y' | b'y' => "Y",
+        b'Z' | b'z' => "Z",
+        b'0'..=b'9' | b'.' | b' ' => match byte {
+            b'0' => "0",
+            b'1' => "1",
+            b'2' => "2",
+            b'3' => "3",
+            b'4' => "4",
+            b'5' => "5",
+            b'6' => "6",
+            b'7' => "7",
+            b'8' => "8",
+            b'9' => "9",
+            b'.' => ".",
+            _ => " ",
+        },
+        _ => " ",
+    }
+}
+
+fn holographic_button(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    label: &str,
+    accent: [u8; 3],
+) {
+    holographic_panel(buf, width, height, stride, bpp, fmt, x, y, w, h, accent);
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 14,
+        y + 11,
+        label,
+        1,
+        WHITE,
+        false,
+    );
+
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 2,
+        y + h.saturating_sub(2),
+        x + w.saturating_sub(3),
+        y + h.saturating_sub(2),
+        accent,
+    );
+}
+
+fn holographic_emblem(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+) {
+    // Broad holographic bloom.
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r + 48,
+        [22, 35, 90],
+        22,
+    );
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r + 27,
+        [12, 80, 105],
+        30,
+    );
+
+    // Tilted orbital impression using offset rings and diagonal energy arcs.
+    orbit_ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy - 5,
+        r + 30,
+        [12, 74, 108],
+    );
+    orbit_ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy + 6,
+        r + 20,
+        [86, 18, 100],
+    );
+
+    ring(buf, width, height, stride, bpp, fmt, cx, cy, r, CYAN);
+    ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r.saturating_sub(13),
+        MAGENTA,
+    );
+
+    // Inner lens.
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r / 2,
+        [20, 65, 105],
+        70,
+    );
+    circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r / 2,
+        [5, 12, 31],
+    );
+    ring(buf, width, height, stride, bpp, fmt, cx, cy, r / 2, CYAN);
+
+    // Floating T-core diamond.
+    diamond(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        (r / 6).max(7),
+        WHITE,
+    );
+    diamond(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        (r / 10).max(4),
+        CYAN,
+    );
+
+    // Energy axes.
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx.saturating_sub(r + 70),
+        cy,
+        cx + r + 70,
+        cy,
+        [12, 45, 70],
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy.saturating_sub(r + 70),
+        cx,
+        cy + r + 70,
+        [12, 45, 70],
+    );
+}
+
+fn holo_chip(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    label: &str,
+    accent: [u8; 3],
+) {
+    holographic_panel(buf, width, height, stride, bpp, fmt, x, y, w, h, accent);
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 9,
+        y + 8,
+        label,
+        1,
+        accent,
+    );
+}
+
+fn status_dot(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    color: [u8; 3],
+) {
+    glow_circle(buf, width, height, stride, bpp, fmt, x, y, 8, color, 70);
+    circle(buf, width, height, stride, bpp, fmt, x, y, 3, color);
+}
+
+fn corner_mark(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    color: [u8; 3],
+    left: bool,
+    top: bool,
+) {
+    let len = (width.min(height) / 30).max(22);
+
+    if left && top {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y,
+            x + len,
+            y,
+            color,
+        );
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y,
+            x,
+            y + len,
+            color,
+        );
+    } else if !left && top {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x.saturating_sub(len),
+            y,
+            x,
+            y,
+            color,
+        );
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y,
+            x,
+            y + len,
+            color,
+        );
+    } else if left {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y,
+            x + len,
+            y,
+            color,
+        );
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y.saturating_sub(len),
+            x,
+            y,
+            color,
+        );
+    } else {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x.saturating_sub(len),
+            y,
+            x,
+            y,
+            color,
+        );
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y.saturating_sub(len),
+            x,
+            y,
+            color,
+        );
+    }
+}
+
+fn metrics_panel(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    usable_memory_regions: usize,
+) {
+    holographic_panel(buf, width, height, stride, bpp, fmt, x, y, w, h, CYAN);
+
+    let cell = w / 5;
+
+    metric_card(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x,
+        y,
+        cell,
+        h,
+        "SYSTEM HEALTH",
+        "99.5%",
+        GREEN,
+        "SIMULATED LIVE",
+    );
+    metric_card(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + cell,
+        y,
+        cell,
+        h,
+        "ACTIVE REALMS",
+        "06",
+        CYAN,
+        "CONTEXT READY",
+    );
+    metric_card(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + cell * 2,
+        y,
+        cell,
+        h,
+        "LIVE AGENTS",
+        "04",
+        MAGENTA,
+        "PER ACTIVE REALM",
+    );
+    metric_card(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + cell * 3,
+        y,
+        cell,
+        h,
+        "REQ QUEUE",
+        "04",
+        GOLD,
+        "TRACEABLE",
+    );
+
+    let mem_label = if usable_memory_regions > 9 {
+        "1.0K"
+    } else {
+        "0.5K"
+    };
+    metric_card(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + cell * 4,
+        y,
+        w - cell * 4,
+        h,
+        "EVENTS / 24H",
+        mem_label,
+        GREEN,
+        "SIMULATED TELEMETRY",
+    );
+}
+
+fn metric_card(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    label: &str,
+    value: &str,
+    accent: [u8; 3],
+    sub: &str,
+) {
+    if x > 0 {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y + 8,
+            x,
+            y + h.saturating_sub(8),
+            [12, 28, 48],
+        );
+    }
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 18,
+        y + 12,
+        label,
+        1,
+        DIM,
+    );
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 18,
+        y + 30,
+        value,
+        3,
+        accent,
+        true,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 18,
+        y + 69,
+        sub,
+        1,
+        GREEN,
+    );
+}
+
+fn holographic_background(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+) {
+    let cx = width / 2;
+    let cy = height / 2;
+    let max_d = ((width * width + height * height) as u64).max(1);
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as i64 - cx as i64;
+            let dy = y as i64 - cy as i64;
+            let d2 = (dx * dx + dy * dy) as u64;
+            let radial = 255u64.saturating_sub(d2.saturating_mul(255) / max_d);
+            let band = ((y * 255) / height.max(1)) as u64;
+            let r = 2 + radial * 15 / 255 + band * 2 / 255;
+            let g = 2 + radial * 7 / 255;
+            let b = 11 + radial * 35 / 255 + band * 7 / 255;
+            pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                x,
+                y,
+                [r.min(255) as u8, g.min(255) as u8, b.min(255) as u8],
+            );
+        }
+    }
+    let grid = (width / 120).max(12);
+    let mut y = 0;
+    while y < height {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            0,
+            y,
+            width - 1,
+            y,
+            if y % (grid * 8) == 0 {
+                [4, 11, 31]
+            } else {
+                [2, 6, 18]
+            },
+        );
+        y += grid;
+    }
+    let mut x = 0;
+    while x < width {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            0,
+            x,
+            height - 1,
+            if x % (grid * 8) == 0 {
+                [4, 11, 31]
+            } else {
+                [2, 6, 18]
+            },
+        );
+        x += grid;
+    }
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width * 73 / 100,
+        height * 44 / 100,
+        width.min(height) / 3,
+        [12, 30, 72],
+        30,
+    );
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width * 73 / 100,
+        height * 44 / 100,
+        width.min(height) / 5,
+        [14, 60, 80],
+        24,
+    );
+}
+
+fn holographic_chassis(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    inset: usize,
+) {
+    let x = inset;
+    let y = inset;
+    let w = width.saturating_sub(inset * 2);
+    let h = height.saturating_sub(inset * 2);
+    frame(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x,
+        y,
+        w,
+        h,
+        [8, 45, 70],
+    );
+    let arm = (width.min(height) / 24).max(22);
+    line(buf, width, height, stride, bpp, fmt, x, y, x + arm, y, CYAN);
+    line(buf, width, height, stride, bpp, fmt, x, y, x, y + arm, CYAN);
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width - x - arm,
+        y,
+        width - x,
+        y,
+        MAGENTA,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width - x,
+        y,
+        width - x,
+        y + arm,
+        MAGENTA,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x,
+        height - y,
+        x + arm,
+        height - y,
+        GOLD,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x,
+        height - y - arm,
+        x,
+        height - y,
+        GOLD,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width - x - arm,
+        height - y,
+        width - x,
+        height - y,
+        CYAN,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        width - x,
+        height - y - arm,
+        width - x,
+        height - y,
+        CYAN,
+    );
+}
+
+fn glass_surface(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    accent: [u8; 3],
+) {
+    if w < 8 || h < 8 || x >= width || y >= height {
+        return;
+    }
+    let x2 = x.saturating_add(w).min(width);
+    let y2 = y.saturating_add(h).min(height);
+    for yy in y..y2 {
+        let v = if h > 1 { ((yy - y) * 7 / h) as u8 } else { 0 };
+        for xx in x..x2 {
+            let edge = if xx == x || xx + 1 == x2 || yy == y || yy + 1 == y2 {
+                9
+            } else {
+                3
+            };
+            pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                xx,
+                yy,
+                [2 + edge / 2, 5 + edge / 2 + v / 2, 18 + edge + v],
+            );
+        }
+    }
+    glow_frame(buf, width, height, stride, bpp, fmt, x, y, w, h, accent);
+}
+
+fn holographic_orb(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+) {
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r + 42,
+        [10, 55, 85],
+        42,
+    );
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r + 18,
+        [20, 75, 105],
+        35,
+    );
+    // Elliptical-looking orbit bands made from offset circular rings.
+    orbit_ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy - 7,
+        r + 30,
+        [10, 70, 95],
+    );
+    orbit_ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy + 6,
+        r + 22,
+        [85, 15, 92],
+    );
+    ring(buf, width, height, stride, bpp, fmt, cx, cy, r, CYAN);
+    ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r.saturating_sub(11),
+        MAGENTA,
+    );
+    glow_circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r / 2,
+        [12, 70, 90],
+        55,
+    );
+    circle(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        r / 2,
+        [4, 18, 38],
+    );
+    ring(buf, width, height, stride, bpp, fmt, cx, cy, r / 2, CYAN);
+    diamond(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        (r / 6).max(8),
+        CYAN,
+    );
+}
+
+fn capability(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    color: [u8; 3],
+    title: &str,
+    value: &str,
+) {
+    glow_circle(buf, width, height, stride, bpp, fmt, x, y, 20, color, 35);
+    ring(buf, width, height, stride, bpp, fmt, x, y, 18, color);
+    diamond(buf, width, height, stride, bpp, fmt, x, y, 5, color);
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x.saturating_sub(title.len() * 3),
+        y + 27,
+        title,
+        1,
+        color,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x.saturating_sub(value.len() * 3),
+        y + 41,
+        value,
+        1,
+        DIM,
+    );
+}
+
+fn metric(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    label: &str,
+    value: &str,
+    color: [u8; 3],
+) {
+    text(buf, width, height, stride, bpp, fmt, x, y, label, 1, DIM);
+    text_scaled(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x,
+        y + 20,
+        value,
+        3,
+        color,
+        true,
+    );
+}
+
+fn glow_frame(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: [u8; 3],
+) {
+    if w < 4 || h < 4 {
+        return;
+    }
+
+    let x2 = x.saturating_add(w).min(width);
+    let y2 = y.saturating_add(h).min(height);
+
+    // Dim halo first.
+    frame(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x.saturating_sub(2),
+        y.saturating_sub(2),
+        w.saturating_add(4),
+        h.saturating_add(4),
+        [3, 18, 30],
+    );
+
+    // Crisp edge.
+    frame(buf, width, height, stride, bpp, fmt, x, y, w, h, color);
+
+    // Bright micro-highlights only at the top and left.
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 2,
+        y + 1,
+        x2.saturating_sub(3),
+        y + 1,
+        color,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 1,
+        y + 2,
+        x + 1,
+        y2.saturating_sub(3),
+        color,
+    );
+}
+
+fn frame(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: [u8; 3],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let x2 = x.saturating_add(w).min(width);
+    let y2 = y.saturating_add(h).min(height);
+    if x >= x2 || y >= y2 {
+        return;
+    }
+    for xx in x..x2 {
+        pixel(buf, width, height, stride, bpp, fmt, xx, y, color);
+        pixel(buf, width, height, stride, bpp, fmt, xx, y2 - 1, color);
+    }
+    for yy in y..y2 {
+        pixel(buf, width, height, stride, bpp, fmt, x, yy, color);
+        pixel(buf, width, height, stride, bpp, fmt, x2 - 1, yy, color);
+    }
+}
+
+fn diamond(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    radius: usize,
+    color: [u8; 3],
+) {
+    let r = radius as isize;
+    for dy in -r..=r {
+        let span = r - dy.abs();
+        let y = cy as isize + dy;
+        if y < 0 {
+            continue;
+        }
+        for dx in -span..=span {
+            let x = cx as isize + dx;
+            if x >= 0 {
+                pixel(
+                    buf, width, height, stride, bpp, fmt, x as usize, y as usize, color,
+                );
+            }
+        }
+    }
+}
+
+fn blend_pixel(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    color: [u8; 3],
+    alpha: u8,
+) {
+    if x >= width || y >= height || bpp < 3 {
+        return;
+    }
+    let p = (y * stride + x) * bpp;
+    if p + 2 >= buf.len() {
+        return;
+    }
+    let a = alpha as u16;
+    let inv = 255u16 - a;
+    match fmt {
+        PixelFormat::Bgr => {
+            buf[p] = ((buf[p] as u16 * inv + color[2] as u16 * a) / 255) as u8;
+            buf[p + 1] = ((buf[p + 1] as u16 * inv + color[1] as u16 * a) / 255) as u8;
+            buf[p + 2] = ((buf[p + 2] as u16 * inv + color[0] as u16 * a) / 255) as u8;
+        }
+        _ => {
+            buf[p] = ((buf[p] as u16 * inv + color[0] as u16 * a) / 255) as u8;
+            buf[p + 1] = ((buf[p + 1] as u16 * inv + color[1] as u16 * a) / 255) as u8;
+            buf[p + 2] = ((buf[p + 2] as u16 * inv + color[2] as u16 * a) / 255) as u8;
+        }
+    }
+}
+
+fn glow_line(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x1: usize,
+    y1: usize,
+    x2: usize,
+    y2: usize,
+    color: [u8; 3],
+) {
+    line(buf, width, height, stride, bpp, fmt, x1, y1, x2, y2, color);
+
+    let offsets = [(1isize, 0isize, 45u8), (-1, 0, 45), (0, 1, 45), (0, -1, 45)];
+
+    for &(ox, oy, alpha) in &offsets {
+        let mut x0 = x1 as isize;
+        let mut y0 = y1 as isize;
+        let x_end = x2 as isize;
+        let y_end = y2 as isize;
+        let dx = (x_end - x0).abs();
+        let sx = if x0 < x_end { 1 } else { -1 };
+        let dy = -(y_end - y0).abs();
+        let sy = if y0 < y_end { 1 } else { -1 };
+        let mut error = dx + dy;
+
+        loop {
+            let gx = x0 + ox;
+            let gy = y0 + oy;
+            if gx >= 0 && gy >= 0 {
+                blend_pixel(
+                    buf,
+                    width,
+                    height,
+                    stride,
+                    bpp,
+                    fmt,
+                    gx as usize,
+                    gy as usize,
+                    color,
+                    alpha,
+                );
+            }
+
+            if x0 == x_end && y0 == y_end {
+                break;
+            }
+
+            let e2 = 2 * error;
+            if e2 >= dy {
+                error += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                error += dx;
+                y0 += sy;
+            }
+        }
+    }
+}
+
+fn glow_circle(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    color: [u8; 3],
+    alpha: u8,
+) {
+    let outer = r as isize;
+    let inner = r.saturating_sub(5) as isize;
+    let minx = cx.saturating_sub(r);
+    let maxx = (cx + r).min(width.saturating_sub(1));
+    let miny = cy.saturating_sub(r);
+    let maxy = (cy + r).min(height.saturating_sub(1));
+
+    for y in miny..=maxy {
+        for x in minx..=maxx {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= outer * outer && d2 >= inner * inner {
+                blend_pixel(buf, width, height, stride, bpp, fmt, x, y, color, alpha);
+            }
+        }
+    }
+}
+
+fn orbit_ring(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    color: [u8; 3],
+) {
+    // Deliberately segmented: this reads as a HUD/orbit rather than a plain circle.
+    let outer = r as isize;
+    let inner = r.saturating_sub(1) as isize;
+    let minx = cx.saturating_sub(r);
+    let maxx = (cx + r).min(width.saturating_sub(1));
+    let miny = cy.saturating_sub(r);
+    let maxy = (cy + r).min(height.saturating_sub(1));
+
+    for y in miny..=maxy {
+        for x in minx..=maxx {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+            let d2 = dx * dx + dy * dy;
+
+            if d2 <= outer * outer && d2 >= inner * inner {
+                let bucket = ((x + y) / 7) % 9;
+                if bucket < 4 {
+                    pixel(buf, width, height, stride, bpp, fmt, x, y, color);
+                }
+            }
+        }
+    }
+}
+
+fn text_u64(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    value: u64,
+    scale: usize,
+    color: [u8; 3],
+) {
+    let mut digits = [0u8; 20];
+    let mut n = value;
+    let mut len = 0usize;
+
+    if n == 0 {
+        digits[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 && len < digits.len() {
+            digits[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+    }
+
+    let mut ordered = [0u8; 20];
+    for i in 0..len {
+        ordered[i] = digits[len - 1 - i];
+    }
+
+    text_bytes(
+        buf, width, height, stride, bpp, fmt, x, y, &ordered, len, scale, color,
+    );
+}
+
+fn pixel(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    color: [u8; 3],
+) {
+    if x >= width || y >= height || bpp < 3 {
+        return;
+    }
+
+    let p = (y * stride + x) * bpp;
+
+    if p + 2 >= buf.len() {
+        return;
+    }
+
+    match fmt {
+        PixelFormat::Bgr => {
+            buf[p] = color[2];
+            buf[p + 1] = color[1];
+            buf[p + 2] = color[0];
+        }
+
+        _ => {
+            buf[p] = color[0];
+            buf[p + 1] = color[1];
+            buf[p + 2] = color[2];
+        }
+    }
+}
+
+fn circle(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    color: [u8; 3],
+) {
+    let r2 = (r * r) as isize;
+
+    let minx = cx.saturating_sub(r);
+    let maxx = (cx + r).min(width.saturating_sub(1));
+
+    let miny = cy.saturating_sub(r);
+    let maxy = (cy + r).min(height.saturating_sub(1));
+
+    for y in miny..=maxy {
+        for x in minx..=maxx {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+
+            if dx * dx + dy * dy <= r2 {
+                pixel(buf, width, height, stride, bpp, fmt, x, y, color);
+            }
+        }
+    }
+}
+
+fn ring(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    color: [u8; 3],
+) {
+    let outer = (r * r) as isize;
+    let inner_r = r.saturating_sub(2);
+    let inner = (inner_r * inner_r) as isize;
+
+    let minx = cx.saturating_sub(r);
+    let maxx = (cx + r).min(width.saturating_sub(1));
+
+    let miny = cy.saturating_sub(r);
+    let maxy = (cy + r).min(height.saturating_sub(1));
+
+    for y in miny..=maxy {
+        for x in minx..=maxx {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+            let distance = dx * dx + dy * dy;
+
+            if distance <= outer && distance >= inner {
+                pixel(buf, width, height, stride, bpp, fmt, x, y, color);
+            }
+        }
+    }
+}
+
+fn line(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    start_x: usize,
+    start_y: usize,
+    end_x: usize,
+    end_y: usize,
+    color: [u8; 3],
+) {
+    let mut x0 = start_x as isize;
+    let mut y0 = start_y as isize;
+
+    let x1 = end_x as isize;
+    let y1 = end_y as isize;
+
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+
+    let mut error = dx + dy;
+
+    loop {
+        if x0 >= 0 && y0 >= 0 {
+            pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                x0 as usize,
+                y0 as usize,
+                color,
+            );
+        }
+
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+
+        let e2 = 2 * error;
+
+        if e2 >= dy {
+            error += dy;
+            x0 += sx;
+        }
+
+        if e2 <= dx {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn text_scaled(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    value: &str,
+    scale: usize,
+    color: [u8; 3],
+    glow: bool,
+) {
+    let scale = scale.max(1);
+
+    if glow {
+        let glow_color = [color[0] / 3, color[1] / 3, color[2] / 3];
+
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x.saturating_sub(scale),
+            y,
+            value,
+            scale,
+            glow_color,
+        );
+
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x + scale,
+            y,
+            value,
+            scale,
+            glow_color,
+        );
+    }
+
+    text(
+        buf, width, height, stride, bpp, fmt, x, y, value, scale, color,
+    );
+}
+
+fn text_bytes(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    bytes: &[u8],
+    len: usize,
+    scale: usize,
+    color: [u8; 3],
+) {
+    let mut offset = x;
+
+    for i in 0..len.min(bytes.len()) {
+        let glyph_data = glyph(bytes[i]);
+
+        draw_glyph(
+            buf, width, height, stride, bpp, fmt, offset, y, glyph_data, scale, color,
+        );
+
+        offset += 6 * scale;
+    }
+}
+
+fn text(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    value: &str,
+    scale: usize,
+    color: [u8; 3],
+) {
+    let mut offset = x;
+
+    for byte in value.bytes() {
+        draw_glyph(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            offset,
+            y,
+            glyph(byte),
+            scale,
+            color,
+        );
+
+        offset += 6 * scale;
+    }
+}
+
+fn draw_glyph(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    glyph_data: [u8; 7],
+    scale: usize,
+    color: [u8; 3],
+) {
+    for gy in 0..7 {
+        for gx in 0..5 {
+            if glyph_data[gy] & (1 << (4 - gx)) != 0 {
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        pixel(
+                            buf,
+                            width,
+                            height,
+                            stride,
+                            bpp,
+                            fmt,
+                            x + gx * scale + sx,
+                            y + gy * scale + sy,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn glyph(ch: u8) -> [u8; 7] {
+    match ch {
+        b'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+        b'C' => [0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F],
+        b'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
+        b'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        b'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        b'G' => [0x0F, 0x10, 0x10, 0x17, 0x11, 0x11, 0x0F],
+        b'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'I' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F],
+        b'J' => [0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E],
+        b'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        b'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        b'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+        b'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        b'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        b'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
+        b'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        b'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        b'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
+        b'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        b'Y' => [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+        b'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+
+        b'0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        b'1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        b'2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+        b'3' => [0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E],
+        b'4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        b'5' => [0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E],
+        b'6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        b'7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        b'8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        b'9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+
+        b' ' => [0, 0, 0, 0, 0, 0, 0],
+        b'>' => [0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10],
+        b'-' => [0, 0, 0x1F, 0, 0, 0, 0],
+        b'=' => [0, 0x1F, 0, 0x1F, 0, 0, 0],
+
+        _ => [0x1F, 0x01, 0x05, 0x04, 0x04, 0, 0x04],
+    }
+}

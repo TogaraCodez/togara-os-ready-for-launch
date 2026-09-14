@@ -1,0 +1,381 @@
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use spin::Mutex;
+
+const FRAME_SIZE: u64 = 4096;
+const MAX_USABLE_REGIONS: usize = 32;
+
+// The allocation bitmap covers physical addresses from 0 through 16 GiB.
+// This is sufficient for the current QEMU configuration and keeps the
+// kernel's static bookkeeping bounded. Frames above this limit are not
+// handed out by this allocator until the address-space model is expanded.
+const MAX_TRACKED_PHYSICAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_TRACKED_FRAMES: usize = (MAX_TRACKED_PHYSICAL_BYTES / FRAME_SIZE) as usize;
+const BITMAP_WORDS: usize = MAX_TRACKED_FRAMES / 64;
+
+// A small reclaimed-frame cache makes FREE/ALLOC reuse deterministic without
+// requiring a full scan of the physical address space.
+const FREE_STACK_SIZE: usize = 8192;
+
+static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
+static USABLE_BYTES: AtomicU64 = AtomicU64::new(0);
+static REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static USABLE_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static ALLOCATOR_INITIALIZED: AtomicUsize = AtomicUsize::new(0);
+
+struct AllocatorState {
+    region_starts: [u64; MAX_USABLE_REGIONS],
+    region_ends: [u64; MAX_USABLE_REGIONS],
+    region_cursors: [u64; MAX_USABLE_REGIONS],
+    region_count: usize,
+
+    allocation_bitmap: [u64; BITMAP_WORDS],
+    free_stack: [u64; FREE_STACK_SIZE],
+    free_count: usize,
+}
+
+impl AllocatorState {
+    const fn new() -> Self {
+        Self {
+            region_starts: [0; MAX_USABLE_REGIONS],
+            region_ends: [0; MAX_USABLE_REGIONS],
+            region_cursors: [0; MAX_USABLE_REGIONS],
+            region_count: 0,
+            allocation_bitmap: [0; BITMAP_WORDS],
+            free_stack: [0; FREE_STACK_SIZE],
+            free_count: 0,
+        }
+    }
+}
+
+static ALLOCATOR: Mutex<AllocatorState> = Mutex::new(AllocatorState::new());
+
+#[inline]
+fn align_up(address: u64) -> u64 {
+    address
+        .saturating_add(FRAME_SIZE - 1)
+        .saturating_div(FRAME_SIZE)
+        .saturating_mul(FRAME_SIZE)
+}
+
+#[inline]
+fn frame_index(address: u64) -> Option<usize> {
+    if address >= MAX_TRACKED_PHYSICAL_BYTES || address % FRAME_SIZE != 0 {
+        return None;
+    }
+
+    Some((address / FRAME_SIZE) as usize)
+}
+
+#[inline]
+fn bitmap_position(index: usize) -> (usize, u64) {
+    let word = index / 64;
+    let mask = 1u64 << (index % 64);
+    (word, mask)
+}
+
+#[inline]
+fn is_allocated_locked(state: &AllocatorState, address: u64) -> bool {
+    let Some(index) = frame_index(address) else {
+        return false;
+    };
+
+    let (word, mask) = bitmap_position(index);
+    state.allocation_bitmap[word] & mask != 0
+}
+
+#[inline]
+fn mark_allocated_locked(state: &mut AllocatorState, address: u64) -> bool {
+    let Some(index) = frame_index(address) else {
+        return false;
+    };
+
+    let (word, mask) = bitmap_position(index);
+
+    if state.allocation_bitmap[word] & mask != 0 {
+        return false;
+    }
+
+    state.allocation_bitmap[word] |= mask;
+    true
+}
+
+#[inline]
+fn mark_free_locked(state: &mut AllocatorState, address: u64) -> bool {
+    let Some(index) = frame_index(address) else {
+        return false;
+    };
+
+    let (word, mask) = bitmap_position(index);
+
+    if state.allocation_bitmap[word] & mask == 0 {
+        return false;
+    }
+
+    state.allocation_bitmap[word] &= !mask;
+    true
+}
+
+/// Initialize the physical-memory inventory and reclaimable frame allocator.
+///
+/// Only regions explicitly marked `Usable` by the bootloader enter the
+/// allocator. All other memory remains unavailable to `allocate_frame`.
+pub fn init(regions: &[MemoryRegion]) -> usize {
+    let mut total_bytes = 0u64;
+    let mut usable_bytes = 0u64;
+
+    let mut state = ALLOCATOR.lock();
+    *state = AllocatorState::new();
+
+    for region in regions {
+        let bytes = region.end.saturating_sub(region.start);
+        total_bytes = total_bytes.saturating_add(bytes);
+
+        if matches!(region.kind, MemoryRegionKind::Usable) {
+            usable_bytes = usable_bytes.saturating_add(bytes);
+
+            if state.region_count < MAX_USABLE_REGIONS {
+                let start = align_up(region.start);
+                let end = region.end / FRAME_SIZE * FRAME_SIZE;
+
+                if start < end && start < MAX_TRACKED_PHYSICAL_BYTES {
+                    let clamped_end = end.min(MAX_TRACKED_PHYSICAL_BYTES);
+
+                    if start < clamped_end {
+                        let index = state.region_count;
+                        state.region_starts[index] = start;
+                        state.region_ends[index] = clamped_end;
+                        state.region_cursors[index] = start;
+                        state.region_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    TOTAL_BYTES.store(total_bytes, Ordering::Relaxed);
+    USABLE_BYTES.store(usable_bytes, Ordering::Relaxed);
+    REGION_COUNT.store(regions.len(), Ordering::Relaxed);
+    USABLE_REGION_COUNT.store(state.region_count, Ordering::Relaxed);
+    ALLOCATED_FRAMES.store(0, Ordering::Relaxed);
+    ALLOCATOR_INITIALIZED.store(1, Ordering::Release);
+
+    state.region_count
+}
+
+/// Allocate one physical 4 KiB frame.
+///
+/// Reclaimed frames are reused first. Otherwise allocation advances through
+/// the bootloader-provided usable regions.
+pub fn allocate_frame() -> Option<u64> {
+    if !allocator_initialized() {
+        return None;
+    }
+
+    let mut state = ALLOCATOR.lock();
+
+    if state.free_count > 0 {
+        state.free_count -= 1;
+        let address = state.free_stack[state.free_count];
+
+        if mark_allocated_locked(&mut state, address) {
+            ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            return Some(address);
+        }
+    }
+
+    let mut index = 0usize;
+
+    while index < state.region_count {
+        let cursor = state.region_cursors[index];
+        let end = state.region_ends[index];
+
+        if cursor < end {
+            let next = cursor.saturating_add(FRAME_SIZE);
+
+            if next <= end {
+                state.region_cursors[index] = next;
+
+                if mark_allocated_locked(&mut state, cursor) {
+                    ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+                    return Some(cursor);
+                }
+            }
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+/// Release an allocated physical frame back to the allocator.
+///
+/// The frame must be 4 KiB aligned, belong to a usable region, and currently
+/// be marked allocated. Double frees are rejected.
+pub fn free_frame(address: u64) -> bool {
+    if !allocator_initialized() {
+        return false;
+    }
+
+    let mut state = ALLOCATOR.lock();
+
+    if !is_usable_address_locked(&state, address) || !is_allocated_locked(&state, address) {
+        return false;
+    }
+
+    if state.free_count >= FREE_STACK_SIZE {
+        return false;
+    }
+
+    if !mark_free_locked(&mut state, address) {
+        return false;
+    }
+
+    let free_index = state.free_count;
+    state.free_stack[free_index] = address;
+    state.free_count += 1;
+    ALLOCATED_FRAMES.fetch_sub(1, Ordering::Relaxed);
+
+    true
+}
+
+/// Release the most recently allocated frame that has not already been freed.
+///
+/// This is the shell-friendly form used by the `FREE` command. The allocator
+/// itself also exposes `free_frame(address)` for kernel services.
+pub fn free_last_frame() -> Option<u64> {
+    if !allocator_initialized() {
+        return None;
+    }
+
+    let mut state = ALLOCATOR.lock();
+
+    if state.free_count >= FREE_STACK_SIZE {
+        return None;
+    }
+
+    // Walk the tracked physical map backwards from the highest cursor and
+    // find the highest currently allocated frame. This keeps FREE useful from
+    // the shell without maintaining a second allocation-order stack.
+    let mut region = state.region_count;
+
+    while region > 0 {
+        region -= 1;
+
+        let cursor = state.region_cursors[region];
+        let start = state.region_starts[region];
+
+        if cursor <= start {
+            continue;
+        }
+
+        let mut address = cursor.saturating_sub(FRAME_SIZE);
+
+        loop {
+            if is_allocated_locked(&state, address) {
+                if mark_free_locked(&mut state, address) {
+                    let free_index = state.free_count;
+                    state.free_stack[free_index] = address;
+                    state.free_count += 1;
+                    ALLOCATED_FRAMES.fetch_sub(1, Ordering::Relaxed);
+                    return Some(address);
+                }
+            }
+
+            if address <= start {
+                break;
+            }
+
+            address = address.saturating_sub(FRAME_SIZE);
+        }
+    }
+
+    None
+}
+
+fn is_usable_address_locked(state: &AllocatorState, address: u64) -> bool {
+    if frame_index(address).is_none() {
+        return false;
+    }
+
+    let mut index = 0usize;
+
+    while index < state.region_count {
+        if address >= state.region_starts[index] && address < state.region_ends[index] {
+            return true;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+#[inline]
+pub fn allocated_frames() -> u64 {
+    ALLOCATED_FRAMES.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn allocated_bytes() -> u64 {
+    allocated_frames().saturating_mul(FRAME_SIZE)
+}
+
+#[inline]
+pub fn free_frames() -> u64 {
+    let total_frames = usable_bytes() / FRAME_SIZE;
+    total_frames.saturating_sub(allocated_frames())
+}
+
+#[inline]
+pub fn allocator_initialized() -> bool {
+    ALLOCATOR_INITIALIZED.load(Ordering::Acquire) != 0
+}
+
+#[inline]
+pub fn total_bytes() -> u64 {
+    TOTAL_BYTES.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn usable_bytes() -> u64 {
+    USABLE_BYTES.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn reserved_bytes() -> u64 {
+    total_bytes().saturating_sub(usable_bytes())
+}
+
+#[inline]
+pub fn region_count() -> u64 {
+    REGION_COUNT.load(Ordering::Relaxed) as u64
+}
+
+#[inline]
+pub fn usable_region_count() -> u64 {
+    USABLE_REGION_COUNT.load(Ordering::Relaxed) as u64
+}
+
+#[inline]
+pub fn total_mib() -> u64 {
+    total_bytes() / (1024 * 1024)
+}
+
+#[inline]
+pub fn usable_mib() -> u64 {
+    usable_bytes() / (1024 * 1024)
+}
+
+#[inline]
+pub fn reserved_mib() -> u64 {
+    reserved_bytes() / (1024 * 1024)
+}
+
+#[inline]
+pub fn allocated_mib() -> u64 {
+    allocated_bytes() / (1024 * 1024)
+}

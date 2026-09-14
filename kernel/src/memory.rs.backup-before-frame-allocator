@@ -1,0 +1,215 @@
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+
+const FRAME_SIZE: u64 = 4096;
+const MAX_USABLE_REGIONS: usize = 32;
+
+static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
+static USABLE_BYTES: AtomicU64 = AtomicU64::new(0);
+static REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static USABLE_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+static ALLOCATED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static ALLOCATOR_INITIALIZED: AtomicUsize = AtomicUsize::new(0);
+
+static REGION_STARTS: [AtomicU64; MAX_USABLE_REGIONS] =
+    [const { AtomicU64::new(0) }; MAX_USABLE_REGIONS];
+
+static REGION_ENDS: [AtomicU64; MAX_USABLE_REGIONS] =
+    [const { AtomicU64::new(0) }; MAX_USABLE_REGIONS];
+
+static REGION_CURSORS: [AtomicU64; MAX_USABLE_REGIONS] =
+    [const { AtomicU64::new(0) }; MAX_USABLE_REGIONS];
+
+static ALLOCATOR_LOCK: AtomicUsize = AtomicUsize::new(0);
+
+/// Align an address upward to the next 4 KiB frame boundary.
+#[inline]
+fn align_up(address: u64) -> u64 {
+    address
+        .saturating_add(FRAME_SIZE - 1)
+        .saturating_div(FRAME_SIZE)
+        .saturating_mul(FRAME_SIZE)
+}
+
+/// Initialize the physical-memory inventory and frame allocator.
+///
+/// Only regions explicitly marked `Usable` by the bootloader are entered
+/// into the allocator. Reserved, kernel, bootloader, framebuffer, ACPI,
+/// and other non-usable regions are therefore excluded.
+pub fn init(regions: &[MemoryRegion]) -> usize {
+    let mut total_bytes = 0u64;
+    let mut usable_bytes = 0u64;
+    let mut usable_regions = 0usize;
+
+    for region in regions {
+        let bytes = region.end.saturating_sub(region.start);
+
+        total_bytes = total_bytes.saturating_add(bytes);
+
+        if matches!(region.kind, MemoryRegionKind::Usable) {
+            usable_bytes = usable_bytes.saturating_add(bytes);
+
+            if usable_regions < MAX_USABLE_REGIONS {
+                let start = align_up(region.start);
+                let end = region.end / FRAME_SIZE * FRAME_SIZE;
+
+                if start < end {
+                    REGION_STARTS[usable_regions].store(start, Ordering::Relaxed);
+                    REGION_ENDS[usable_regions].store(end, Ordering::Relaxed);
+                    REGION_CURSORS[usable_regions].store(start, Ordering::Relaxed);
+
+                    usable_regions += 1;
+                }
+            }
+        }
+    }
+
+    TOTAL_BYTES.store(total_bytes, Ordering::Relaxed);
+    USABLE_BYTES.store(usable_bytes, Ordering::Relaxed);
+    REGION_COUNT.store(regions.len(), Ordering::Relaxed);
+    USABLE_REGION_COUNT.store(usable_regions, Ordering::Relaxed);
+
+    ALLOCATED_FRAMES.store(0, Ordering::Relaxed);
+    ALLOCATOR_INITIALIZED.store(1, Ordering::Release);
+
+    usable_regions
+}
+
+/// Allocate one physical 4 KiB frame.
+///
+/// Returns the physical address of the allocated frame.
+///
+/// This is intentionally a bump allocator for the first allocator
+/// milestone. Frames are not reclaimable yet; `free_frame()` will be
+/// introduced with the bitmap allocator in the next stage.
+pub fn allocate_frame() -> Option<u64> {
+    if ALLOCATOR_INITIALIZED.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+
+    lock();
+
+    let result = allocate_frame_locked();
+
+    unlock();
+
+    if result.is_some() {
+        ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    result
+}
+
+fn allocate_frame_locked() -> Option<u64> {
+    let region_count = usable_region_count() as usize;
+
+    let mut index = 0usize;
+
+    while index < region_count {
+        let cursor = REGION_CURSORS[index].load(Ordering::Relaxed);
+        let end = REGION_ENDS[index].load(Ordering::Relaxed);
+
+        if cursor < end {
+            let next = cursor.saturating_add(FRAME_SIZE);
+
+            if next <= end {
+                REGION_CURSORS[index].store(next, Ordering::Relaxed);
+                return Some(cursor);
+            }
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+/// Return the number of successfully allocated physical frames.
+#[inline]
+pub fn allocated_frames() -> u64 {
+    ALLOCATED_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Return the number of bytes currently represented by allocated frames.
+#[inline]
+pub fn allocated_bytes() -> u64 {
+    allocated_frames().saturating_mul(FRAME_SIZE)
+}
+
+/// Return whether the physical frame allocator has been initialized.
+#[inline]
+pub fn allocator_initialized() -> bool {
+    ALLOCATOR_INITIALIZED.load(Ordering::Acquire) != 0
+}
+
+/// Return the total physical memory represented by the bootloader map.
+#[inline]
+pub fn total_bytes() -> u64 {
+    TOTAL_BYTES.load(Ordering::Relaxed)
+}
+
+/// Return the physical memory marked usable by the bootloader.
+#[inline]
+pub fn usable_bytes() -> u64 {
+    USABLE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Return memory represented by non-usable regions.
+#[inline]
+pub fn reserved_bytes() -> u64 {
+    total_bytes().saturating_sub(usable_bytes())
+}
+
+/// Return the total number of bootloader memory regions.
+#[inline]
+pub fn region_count() -> u64 {
+    REGION_COUNT.load(Ordering::Relaxed) as u64
+}
+
+/// Return the number of usable regions accepted by the allocator.
+#[inline]
+pub fn usable_region_count() -> u64 {
+    USABLE_REGION_COUNT.load(Ordering::Relaxed) as u64
+}
+
+#[inline]
+pub fn total_mib() -> u64 {
+    total_bytes() / (1024 * 1024)
+}
+
+#[inline]
+pub fn usable_mib() -> u64 {
+    usable_bytes() / (1024 * 1024)
+}
+
+#[inline]
+pub fn reserved_mib() -> u64 {
+    reserved_bytes() / (1024 * 1024)
+}
+
+#[inline]
+pub fn allocated_mib() -> u64 {
+    allocated_bytes() / (1024 * 1024)
+}
+
+#[inline]
+fn lock() {
+    while ALLOCATOR_LOCK
+        .compare_exchange(
+            0,
+            1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn unlock() {
+    ALLOCATOR_LOCK.store(0, Ordering::Release);
+}

@@ -1,0 +1,1807 @@
+#![no_std]
+#![no_main]
+#![feature(abi_x86_interrupt)]
+
+mod interrupts;
+
+use bootloader_api::info::{FrameBuffer, PixelFormat};
+use bootloader_api::{BootInfo, entry_point};
+use core::panic::PanicInfo;
+
+const BG: [u8; 3] = [1, 2, 10];
+const BG_MID: [u8; 3] = [2, 7, 18];
+const PANEL: [u8; 3] = [3, 9, 23];
+const PANEL2: [u8; 3] = [5, 13, 31];
+const PANEL3: [u8; 3] = [2, 5, 15];
+const EDGE: [u8; 3] = [10, 34, 58];
+
+const CYAN: [u8; 3] = [40, 245, 255];
+const CYAN_GLOW: [u8; 3] = [10, 92, 120];
+const CYAN_DARK: [u8; 3] = [4, 30, 48];
+const MAGENTA: [u8; 3] = [255, 35, 220];
+const MAGENTA_GLOW: [u8; 3] = [92, 12, 78];
+const GOLD: [u8; 3] = [255, 205, 70];
+const GOLD_GLOW: [u8; 3] = [100, 65, 20];
+const WHITE: [u8; 3] = [235, 252, 255];
+const DIM: [u8; 3] = [82, 125, 155];
+const DIM2: [u8; 3] = [38, 67, 92];
+const GREEN: [u8; 3] = [70, 255, 165];
+const RED: [u8; 3] = [255, 75, 95];
+
+const MAX_INPUT: usize = 64;
+
+entry_point!(kernel_main);
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    let usable_memory_regions = boot_info
+        .memory_regions
+        .iter()
+        .filter(|region| matches!(region.kind, bootloader_api::info::MemoryRegionKind::Usable))
+        .count();
+
+    interrupts::init();
+
+    if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
+        run_desktop(framebuffer, usable_memory_regions);
+    }
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn run_desktop(framebuffer: &mut FrameBuffer, usable_memory_regions: usize) -> ! {
+    let mut input = [0u8; MAX_INPUT];
+    let mut input_len = 0usize;
+
+    draw_desktop(
+        framebuffer,
+        usable_memory_regions,
+        &input,
+        input_len,
+        "",
+        GREEN,
+    );
+
+    loop {
+        let scancode = match interrupts::keyboard::pop_scancode() {
+            Some(scancode) => scancode,
+            None => {
+                core::hint::spin_loop();
+                continue;
+            }
+        };
+
+        // Ignore key-release scancodes.
+        if scancode & 0x80 != 0 {
+            continue;
+        }
+
+        let ascii = scancode_to_ascii(scancode);
+
+        if ascii == b'\n' {
+            let result = execute_command(&input[..input_len]);
+
+            draw_desktop(
+                framebuffer,
+                usable_memory_regions,
+                &input,
+                input_len,
+                result.0,
+                result.1,
+            );
+
+            input_len = 0;
+            input.fill(0);
+        } else if ascii == 8 {
+            if input_len > 0 {
+                input_len -= 1;
+                input[input_len] = 0;
+            }
+
+            draw_desktop(
+                framebuffer,
+                usable_memory_regions,
+                &input,
+                input_len,
+                "",
+                GREEN,
+            );
+        } else if ascii != 0 && input_len < MAX_INPUT {
+            input[input_len] = ascii;
+            input_len += 1;
+
+            draw_desktop(
+                framebuffer,
+                usable_memory_regions,
+                &input,
+                input_len,
+                "",
+                GREEN,
+            );
+        }
+    }
+}
+
+fn scancode_to_ascii(scancode: u8) -> u8 {
+    match scancode {
+        // Number row.
+        0x02 => b'1',
+        0x03 => b'2',
+        0x04 => b'3',
+        0x05 => b'4',
+        0x06 => b'5',
+        0x07 => b'6',
+        0x08 => b'7',
+        0x09 => b'8',
+        0x0A => b'9',
+        0x0B => b'0',
+
+        // QWERTY.
+        0x10 => b'Q',
+        0x11 => b'W',
+        0x12 => b'E',
+        0x13 => b'R',
+        0x14 => b'T',
+        0x15 => b'Y',
+        0x16 => b'U',
+        0x17 => b'I',
+        0x18 => b'O',
+        0x19 => b'P',
+
+        0x1E => b'A',
+        0x1F => b'S',
+        0x20 => b'D',
+        0x21 => b'F',
+        0x22 => b'G',
+        0x23 => b'H',
+        0x24 => b'J',
+        0x25 => b'K',
+        0x26 => b'L',
+
+        0x2C => b'Z',
+        0x2D => b'X',
+        0x2E => b'C',
+        0x2F => b'V',
+        0x30 => b'B',
+        0x31 => b'N',
+        0x32 => b'M',
+
+        // Controls / symbols.
+        0x39 => b' ',
+        0x0C => b'-',
+        0x0D => b'=',
+        0x1C => b'\n',
+        0x0E => 8,
+
+        _ => 0,
+    }
+}
+
+fn execute_command(command: &[u8]) -> (&'static str, [u8; 3]) {
+    if equals(command, b"HELP") {
+        return (
+            "COMMANDS: HELP REALMS MEMORY EVENTS SYSTEM CLEAR ABOUT",
+            CYAN,
+        );
+    }
+
+    if equals(command, b"REALMS") {
+        return ("REALMS: CORE MEMORY EVENTS NETWORK SHELL", MAGENTA);
+    }
+
+    if equals(command, b"MEMORY") {
+        return ("MEMORY REALM ONLINE - BOOT MEMORY MAP AVAILABLE", GOLD);
+    }
+
+    if equals(command, b"EVENTS") {
+        return ("EVENT FABRIC ONLINE - INPUT EVENTS ACTIVE", CYAN);
+    }
+
+    if equals(command, b"SYSTEM") {
+        return ("TOGARA CORE ONLINE - KERNEL EXECUTING", GREEN);
+    }
+
+    if equals(command, b"CLEAR") {
+        return ("", WHITE);
+    }
+
+    if equals(command, b"ABOUT") {
+        return ("TOGARA OS - BARE METAL OPERATING INTELLIGENCE", WHITE);
+    }
+
+    if command.is_empty() {
+        return ("", WHITE);
+    }
+
+    ("UNKNOWN COMMAND - TYPE HELP", RED)
+}
+
+fn equals(value: &[u8], expected: &[u8]) -> bool {
+    if value.len() != expected.len() {
+        return false;
+    }
+
+    let mut i = 0;
+
+    while i < expected.len() {
+        if value[i] != expected[i] {
+            return false;
+        }
+
+        i += 1;
+    }
+
+    true
+}
+
+fn draw_desktop(
+    framebuffer: &mut FrameBuffer,
+    usable_memory_regions: usize,
+    input: &[u8; MAX_INPUT],
+    input_len: usize,
+    message: &str,
+    message_color: [u8; 3],
+) {
+    let info = framebuffer.info();
+    let width = info.width;
+    let height = info.height;
+    let stride = info.stride;
+    let bpp = info.bytes_per_pixel;
+    let format = info.pixel_format;
+    let buf = framebuffer.buffer_mut();
+
+    // Premium dark base with a subtle vertical atmosphere.
+    gradient_fill(buf, width, height, stride, bpp, format);
+
+    // Sparse technical markings instead of a full-screen grid.
+    technical_background(buf, width, height, stride, bpp, format);
+
+    // Outer glass chassis.
+    glow_frame(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        14,
+        14,
+        width.saturating_sub(28),
+        height.saturating_sub(28),
+        CYAN,
+    );
+    corner_brackets(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        24,
+        24,
+        width.saturating_sub(48),
+        height.saturating_sub(48),
+    );
+
+    // ==================== COMMAND / STATUS HEADER ====================
+    let header_x = 48usize;
+    let header_y = 38usize;
+    let header_w = width.saturating_sub(96);
+    let header_h = 78usize;
+
+    panel(
+        buf, width, height, stride, bpp, format, header_x, header_y, header_w, header_h, PANEL2,
+        EDGE,
+    );
+    glow_frame(
+        buf, width, height, stride, bpp, format, header_x, header_y, header_w, header_h, CYAN_GLOW,
+    );
+
+    // Left identity block.
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        header_x + 20,
+        header_y + 12,
+        "TOGARA",
+        4,
+        WHITE,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        header_x + 21,
+        header_y + 48,
+        "OPERATING INTELLIGENCE // 0.3",
+        1,
+        CYAN,
+    );
+
+    // Center status rail.
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width / 2 - 120,
+        header_y + 38,
+        width / 2 + 120,
+        header_y + 38,
+        DIM2,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width / 2 - 50,
+        header_y + 26,
+        "NEXUS",
+        2,
+        GOLD,
+    );
+
+    // Right live state.
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width.saturating_sub(260),
+        header_y + 12,
+        "● CORE ONLINE",
+        2,
+        GREEN,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width.saturating_sub(258),
+        header_y + 46,
+        "IRQ / PIT / KBD  ::  NOMINAL",
+        1,
+        DIM,
+    );
+
+    // ==================== CENTRAL REACTOR ====================
+    let cx = width / 2;
+    let cy = 328usize.min(height.saturating_sub(250));
+
+    // Soft concentric aura. Multiple rings create the luminous depth.
+    ring(
+        buf, width, height, stride, bpp, format, cx, cy, 154, CYAN_DARK,
+    );
+    ring(
+        buf, width, height, stride, bpp, format, cx, cy, 145, CYAN_GLOW,
+    );
+    ring(buf, width, height, stride, bpp, format, cx, cy, 119, CYAN);
+    ring(
+        buf, width, height, stride, bpp, format, cx, cy, 92, CYAN_GLOW,
+    );
+    ring(buf, width, height, stride, bpp, format, cx, cy, 72, GOLD);
+    ring(buf, width, height, stride, bpp, format, cx, cy, 57, WHITE);
+
+    // Reactor body.
+    circle(buf, width, height, stride, bpp, format, cx, cy, 50, PANEL3);
+    circle(
+        buf, width, height, stride, bpp, format, cx, cy, 31, CYAN_DARK,
+    );
+    ring(buf, width, height, stride, bpp, format, cx, cy, 31, CYAN);
+
+    // Core crystal.
+    diamond(buf, width, height, stride, bpp, format, cx, cy, 19, WHITE);
+    diamond(buf, width, height, stride, bpp, format, cx, cy, 11, CYAN);
+    diamond(buf, width, height, stride, bpp, format, cx, cy, 4, WHITE);
+
+    // Orbital crosshair.
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        cx.saturating_sub(180),
+        cy,
+        cx.saturating_sub(76),
+        cy,
+        CYAN_GLOW,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        cx + 76,
+        cy,
+        cx + 180,
+        cy,
+        MAGENTA_GLOW,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        cx,
+        cy.saturating_sub(178),
+        cx,
+        cy.saturating_sub(78),
+        CYAN_GLOW,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        cx,
+        cy + 78,
+        cx,
+        cy + 178,
+        GOLD_GLOW,
+    );
+
+    // Four external nodes.
+    let left_x = 190usize.min(width.saturating_sub(100));
+    let right_x = width.saturating_sub(190);
+    let top_y = cy.saturating_sub(75);
+    let bottom_y = cy + 118;
+
+    let nodes = [
+        (left_x, top_y, CYAN, "MEMORY", "ALLOCATOR"),
+        (right_x, top_y, MAGENTA, "EVENTS", "IRQ FABRIC"),
+        (left_x, bottom_y, GOLD, "REALMS", "SERVICES"),
+        (right_x, bottom_y, CYAN, "SYSTEM", "STABLE"),
+    ];
+
+    for &(x, y, color, title, sub) in &nodes {
+        line(buf, width, height, stride, bpp, format, cx, cy, x, y, color);
+        node(buf, width, height, stride, bpp, format, x, y, color);
+        let label_x = x.saturating_sub(36);
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            format,
+            label_x,
+            y + 30,
+            title,
+            1,
+            color,
+        );
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            format,
+            label_x,
+            y + 46,
+            sub,
+            1,
+            DIM,
+        );
+    }
+
+    // Reactor title.
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        cx.saturating_sub(53),
+        cy + 62,
+        "TOGARA CORE",
+        2,
+        WHITE,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        cx.saturating_sub(42),
+        cy + 80,
+        "NEXUS  /  01",
+        1,
+        DIM,
+    );
+
+    // ==================== LEFT TELEMETRY STRIP ====================
+    let telemetry_x = 48usize;
+    let telemetry_y = 148usize;
+    let telemetry_w = 215usize;
+    let telemetry_h = 184usize;
+
+    panel(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x,
+        telemetry_y,
+        telemetry_w,
+        telemetry_h,
+        PANEL,
+        EDGE,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 15,
+        telemetry_y + 13,
+        "SYSTEM TELEMETRY",
+        1,
+        CYAN,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 14,
+        telemetry_y + 34,
+        telemetry_x + telemetry_w - 14,
+        telemetry_y + 34,
+        CYAN_DARK,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 15,
+        telemetry_y + 49,
+        "MEMORY",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 142,
+        telemetry_y + 49,
+        "ONLINE",
+        1,
+        GREEN,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 15,
+        telemetry_y + 73,
+        "INTERRUPTS",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 142,
+        telemetry_y + 73,
+        "ACTIVE",
+        1,
+        CYAN,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 15,
+        telemetry_y + 97,
+        "PIT CLOCK",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 142,
+        telemetry_y + 97,
+        "100 HZ",
+        1,
+        GOLD,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 15,
+        telemetry_y + 121,
+        "KEYBOARD",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 142,
+        telemetry_y + 121,
+        "READY",
+        1,
+        GREEN,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 15,
+        telemetry_y + 150,
+        "MEM MAP",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        telemetry_x + 142,
+        telemetry_y + 150,
+        if usable_memory_regions > 0 {
+            "VALID"
+        } else {
+            "FAULT"
+        },
+        1,
+        if usable_memory_regions > 0 {
+            GREEN
+        } else {
+            RED
+        },
+    );
+
+    // ==================== RIGHT ARCHITECTURE STRIP ====================
+    let arch_w = 215usize;
+    let arch_x = width.saturating_sub(48 + arch_w);
+    let arch_y = 148usize;
+    let arch_h = 184usize;
+
+    panel(
+        buf, width, height, stride, bpp, format, arch_x, arch_y, arch_w, arch_h, PANEL, EDGE,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 15,
+        arch_y + 13,
+        "CORE ARCHITECTURE",
+        1,
+        MAGENTA,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 14,
+        arch_y + 34,
+        arch_x + arch_w - 14,
+        arch_y + 34,
+        MAGENTA_GLOW,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 15,
+        arch_y + 49,
+        "BOOT",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 142,
+        arch_y + 49,
+        "STAGE 4",
+        1,
+        GREEN,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 15,
+        arch_y + 73,
+        "KERNEL",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 142,
+        arch_y + 73,
+        "ONLINE",
+        1,
+        CYAN,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 15,
+        arch_y + 97,
+        "PIC",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 142,
+        arch_y + 97,
+        "MAPPED",
+        1,
+        MAGENTA,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 15,
+        arch_y + 121,
+        "IDT",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 142,
+        arch_y + 121,
+        "LOADED",
+        1,
+        CYAN,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 15,
+        arch_y + 150,
+        "STATE",
+        1,
+        DIM,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        arch_x + 142,
+        arch_y + 150,
+        "NOMINAL",
+        1,
+        GREEN,
+    );
+
+    // ==================== COMMAND CONSOLE ====================
+    let shell_y = height.saturating_sub(176);
+    let shell_x = 48usize;
+    let shell_w = width.saturating_sub(96);
+    let shell_h = 108usize;
+
+    panel(
+        buf, width, height, stride, bpp, format, shell_x, shell_y, shell_w, shell_h, PANEL2, EDGE,
+    );
+    glow_frame(
+        buf, width, height, stride, bpp, format, shell_x, shell_y, shell_w, shell_h, CYAN_GLOW,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        shell_x + 16,
+        shell_y + 10,
+        "COMMAND DECK",
+        2,
+        GOLD,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        shell_x + shell_w.saturating_sub(112),
+        shell_y + 12,
+        "TTY / READY",
+        1,
+        GREEN,
+    );
+
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        shell_x + 16,
+        shell_y + 32,
+        shell_x + shell_w.saturating_sub(16),
+        shell_y + 32,
+        GOLD_GLOW,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        shell_x + 18,
+        shell_y + 46,
+        ">",
+        2,
+        CYAN,
+    );
+    text_bytes(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        shell_x + 38,
+        shell_y + 46,
+        input,
+        input_len,
+        2,
+        WHITE,
+    );
+
+    if message.is_empty() {
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            format,
+            shell_x + 18,
+            shell_y + 79,
+            "TYPE HELP  //  COMMAND MATRIX ONLINE",
+            1,
+            DIM,
+        );
+    } else {
+        text(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            format,
+            shell_x + 18,
+            shell_y + 79,
+            message,
+            1,
+            message_color,
+        );
+    }
+
+    // ==================== FOOTER ====================
+    let footer_y = height.saturating_sub(43);
+
+    text(
+        buf, width, height, stride, bpp, format, 54, footer_y, "NEXUS", 1, CYAN,
+    );
+    text(
+        buf, width, height, stride, bpp, format, 126, footer_y, "REALMS", 1, MAGENTA,
+    );
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        208,
+        footer_y,
+        "EVENT FABRIC",
+        1,
+        GOLD,
+    );
+
+    text(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        format,
+        width.saturating_sub(235),
+        footer_y,
+        if usable_memory_regions > 0 {
+            "MEMORY / VERIFIED"
+        } else {
+            "MEMORY / FAULT"
+        },
+        1,
+        if usable_memory_regions > 0 {
+            GREEN
+        } else {
+            RED
+        },
+    );
+}
+
+fn gradient_fill(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+) {
+    if height == 0 {
+        return;
+    }
+
+    for y in 0..height {
+        let t = ((y * 255) / height) as u8;
+        let color = [
+            1u8.saturating_add(t / 45),
+            2u8.saturating_add(t / 18),
+            10u8.saturating_add(t / 9),
+        ];
+
+        for x in 0..width {
+            pixel(buf, width, height, stride, bpp, fmt, x, y, color);
+        }
+    }
+}
+
+fn technical_background(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+) {
+    // Sparse horizontal scan lines.
+    let mut y = 8usize;
+    while y < height {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            0,
+            y,
+            width.saturating_sub(1),
+            y,
+            [2, 7, 18],
+        );
+        y += 8;
+    }
+
+    // Only major vertical axes; avoids the "cheap grid" appearance.
+    let mut x = 64usize;
+    while x < width {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            0,
+            x,
+            height.saturating_sub(1),
+            [2, 6, 16],
+        );
+        x += 128;
+    }
+
+    // Technical registration marks.
+    for &(x, y) in &[
+        (34usize, 130usize),
+        (width.saturating_sub(35), 130usize),
+        (34, height.saturating_sub(205)),
+        (width.saturating_sub(35), height.saturating_sub(205)),
+    ] {
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x.saturating_sub(8),
+            y,
+            x + 8,
+            y,
+            DIM2,
+        );
+        line(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            x,
+            y.saturating_sub(8),
+            x,
+            y + 8,
+            DIM2,
+        );
+    }
+}
+
+fn glow_frame(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: [u8; 3],
+) {
+    if w < 4 || h < 4 {
+        return;
+    }
+
+    let x2 = x.saturating_add(w).min(width);
+    let y2 = y.saturating_add(h).min(height);
+
+    // Dim halo first.
+    frame(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x.saturating_sub(2),
+        y.saturating_sub(2),
+        w.saturating_add(4),
+        h.saturating_add(4),
+        [3, 18, 30],
+    );
+
+    // Crisp edge.
+    frame(buf, width, height, stride, bpp, fmt, x, y, w, h, color);
+
+    // Bright micro-highlights only at the top and left.
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 2,
+        y + 1,
+        x2.saturating_sub(3),
+        y + 1,
+        color,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x + 1,
+        y + 2,
+        x + 1,
+        y2.saturating_sub(3),
+        color,
+    );
+}
+
+fn frame(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: [u8; 3],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let x2 = x.saturating_add(w).min(width);
+    let y2 = y.saturating_add(h).min(height);
+    if x >= x2 || y >= y2 {
+        return;
+    }
+    for xx in x..x2 {
+        pixel(buf, width, height, stride, bpp, fmt, xx, y, color);
+        pixel(buf, width, height, stride, bpp, fmt, xx, y2 - 1, color);
+    }
+    for yy in y..y2 {
+        pixel(buf, width, height, stride, bpp, fmt, x, yy, color);
+        pixel(buf, width, height, stride, bpp, fmt, x2 - 1, yy, color);
+    }
+}
+
+fn corner_brackets(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) {
+    if w < 20 || h < 20 {
+        return;
+    }
+    let x2 = x.saturating_add(w).min(width.saturating_sub(1));
+    let y2 = y.saturating_add(h).min(height.saturating_sub(1));
+    let arm = 28usize;
+    let c1 = CYAN;
+    let c2 = MAGENTA;
+    let c3 = GOLD;
+
+    line(buf, width, height, stride, bpp, fmt, x, y, x + arm, y, c1);
+    line(buf, width, height, stride, bpp, fmt, x, y, x, y + arm, c1);
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x2.saturating_sub(arm),
+        y,
+        x2,
+        y,
+        c2,
+    );
+    line(buf, width, height, stride, bpp, fmt, x2, y, x2, y + arm, c2);
+    line(buf, width, height, stride, bpp, fmt, x, y2, x + arm, y2, c3);
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x,
+        y2.saturating_sub(arm),
+        x,
+        y2,
+        c3,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x2.saturating_sub(arm),
+        y2,
+        x2,
+        y2,
+        c1,
+    );
+    line(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        x2,
+        y2.saturating_sub(arm),
+        x2,
+        y2,
+        c1,
+    );
+}
+
+fn diamond(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    radius: usize,
+    color: [u8; 3],
+) {
+    let r = radius as isize;
+    for dy in -r..=r {
+        let span = r - dy.abs();
+        let y = cy as isize + dy;
+        if y < 0 {
+            continue;
+        }
+        for dx in -span..=span {
+            let x = cx as isize + dx;
+            if x >= 0 {
+                pixel(
+                    buf, width, height, stride, bpp, fmt, x as usize, y as usize, color,
+                );
+            }
+        }
+    }
+}
+
+fn node(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    color: [u8; 3],
+) {
+    ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        29,
+        [8, 45, 66],
+    );
+    ring(buf, width, height, stride, bpp, fmt, cx, cy, 23, color);
+    ring(
+        buf,
+        width,
+        height,
+        stride,
+        bpp,
+        fmt,
+        cx,
+        cy,
+        15,
+        [10, 35, 55],
+    );
+    diamond(buf, width, height, stride, bpp, fmt, cx, cy, 8, color);
+    diamond(buf, width, height, stride, bpp, fmt, cx, cy, 3, WHITE);
+}
+
+fn pixel(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    color: [u8; 3],
+) {
+    if x >= width || y >= height || bpp < 3 {
+        return;
+    }
+
+    let p = (y * stride + x) * bpp;
+
+    if p + 2 >= buf.len() {
+        return;
+    }
+
+    match fmt {
+        PixelFormat::Bgr => {
+            buf[p] = color[2];
+            buf[p + 1] = color[1];
+            buf[p + 2] = color[0];
+        }
+
+        _ => {
+            buf[p] = color[0];
+            buf[p + 1] = color[1];
+            buf[p + 2] = color[2];
+        }
+    }
+}
+
+fn fill(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    color: [u8; 3],
+) {
+    for y in 0..height {
+        for x in 0..width {
+            pixel(buf, width, height, stride, bpp, fmt, x, y, color);
+        }
+    }
+}
+
+fn panel(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    fill_color: [u8; 3],
+    border_color: [u8; 3],
+) {
+    let x2 = x.saturating_add(w).min(width);
+    let y2 = y.saturating_add(h).min(height);
+
+    for yy in y..y2 {
+        for xx in x..x2 {
+            pixel(buf, width, height, stride, bpp, fmt, xx, yy, fill_color);
+        }
+    }
+
+    for xx in x..x2 {
+        pixel(buf, width, height, stride, bpp, fmt, xx, y, border_color);
+
+        if y2 > 0 {
+            pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                xx,
+                y2 - 1,
+                border_color,
+            );
+        }
+    }
+
+    for yy in y..y2 {
+        pixel(buf, width, height, stride, bpp, fmt, x, yy, border_color);
+
+        if x2 > 0 {
+            pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                x2 - 1,
+                yy,
+                border_color,
+            );
+        }
+    }
+}
+
+fn circle(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    color: [u8; 3],
+) {
+    let r2 = (r * r) as isize;
+
+    let minx = cx.saturating_sub(r);
+    let maxx = (cx + r).min(width.saturating_sub(1));
+
+    let miny = cy.saturating_sub(r);
+    let maxy = (cy + r).min(height.saturating_sub(1));
+
+    for y in miny..=maxy {
+        for x in minx..=maxx {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+
+            if dx * dx + dy * dy <= r2 {
+                pixel(buf, width, height, stride, bpp, fmt, x, y, color);
+            }
+        }
+    }
+}
+
+fn ring(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    color: [u8; 3],
+) {
+    let outer = (r * r) as isize;
+    let inner_r = r.saturating_sub(2);
+    let inner = (inner_r * inner_r) as isize;
+
+    let minx = cx.saturating_sub(r);
+    let maxx = (cx + r).min(width.saturating_sub(1));
+
+    let miny = cy.saturating_sub(r);
+    let maxy = (cy + r).min(height.saturating_sub(1));
+
+    for y in miny..=maxy {
+        for x in minx..=maxx {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+            let distance = dx * dx + dy * dy;
+
+            if distance <= outer && distance >= inner {
+                pixel(buf, width, height, stride, bpp, fmt, x, y, color);
+            }
+        }
+    }
+}
+
+fn line(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    start_x: usize,
+    start_y: usize,
+    end_x: usize,
+    end_y: usize,
+    color: [u8; 3],
+) {
+    let mut x0 = start_x as isize;
+    let mut y0 = start_y as isize;
+
+    let x1 = end_x as isize;
+    let y1 = end_y as isize;
+
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+
+    let mut error = dx + dy;
+
+    loop {
+        if x0 >= 0 && y0 >= 0 {
+            pixel(
+                buf,
+                width,
+                height,
+                stride,
+                bpp,
+                fmt,
+                x0 as usize,
+                y0 as usize,
+                color,
+            );
+        }
+
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+
+        let e2 = 2 * error;
+
+        if e2 >= dy {
+            error += dy;
+            x0 += sx;
+        }
+
+        if e2 <= dx {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn text_bytes(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    bytes: &[u8],
+    len: usize,
+    scale: usize,
+    color: [u8; 3],
+) {
+    let mut offset = x;
+
+    for i in 0..len.min(bytes.len()) {
+        let glyph_data = glyph(bytes[i]);
+
+        draw_glyph(
+            buf, width, height, stride, bpp, fmt, offset, y, glyph_data, scale, color,
+        );
+
+        offset += 6 * scale;
+    }
+}
+
+fn text(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    value: &str,
+    scale: usize,
+    color: [u8; 3],
+) {
+    let mut offset = x;
+
+    for byte in value.bytes() {
+        draw_glyph(
+            buf,
+            width,
+            height,
+            stride,
+            bpp,
+            fmt,
+            offset,
+            y,
+            glyph(byte),
+            scale,
+            color,
+        );
+
+        offset += 6 * scale;
+    }
+}
+
+fn draw_glyph(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    fmt: PixelFormat,
+    x: usize,
+    y: usize,
+    glyph_data: [u8; 7],
+    scale: usize,
+    color: [u8; 3],
+) {
+    for gy in 0..7 {
+        for gx in 0..5 {
+            if glyph_data[gy] & (1 << (4 - gx)) != 0 {
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        pixel(
+                            buf,
+                            width,
+                            height,
+                            stride,
+                            bpp,
+                            fmt,
+                            x + gx * scale + sx,
+                            y + gy * scale + sy,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn glyph(ch: u8) -> [u8; 7] {
+    match ch {
+        b'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+        b'C' => [0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F],
+        b'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
+        b'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        b'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        b'G' => [0x0F, 0x10, 0x10, 0x17, 0x11, 0x11, 0x0F],
+        b'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'I' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F],
+        b'J' => [0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E],
+        b'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        b'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        b'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+        b'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        b'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        b'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
+        b'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        b'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        b'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
+        b'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        b'Y' => [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+        b'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+
+        b'0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        b'1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        b'2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+        b'3' => [0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E],
+        b'4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        b'5' => [0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E],
+        b'6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        b'7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        b'8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        b'9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+
+        b' ' => [0, 0, 0, 0, 0, 0, 0],
+        b'>' => [0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10],
+        b'-' => [0, 0, 0x1F, 0, 0, 0, 0],
+        b'=' => [0, 0x1F, 0, 0x1F, 0, 0, 0],
+
+        _ => [0x1F, 0x01, 0x05, 0x04, 0x04, 0, 0x04],
+    }
+}

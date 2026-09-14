@@ -1,0 +1,16 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bootloader_api = "=0.11.16"
+pic8259 = "0.11.0"
+spin = "0.9.9"
+x86_64 = "0.15.5"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
